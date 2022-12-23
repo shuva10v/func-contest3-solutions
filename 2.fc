@@ -1,0 +1,252 @@
+{-
+ Contract handles internal messages with queries with the following scheme
+  `_# score:uint32 value:(VarUInteger 16) msg:^Cell = MsgInternalBody`,
+  where msg contains message body which shoud be sent later and store it to contract.
+  Once the number of stored queries reaches 12, contract should send and delete
+  from storage message with the highest score and message with the lowest value
+   (if it is the same message, it should be sent once). Messages should be sent with mode 0
+    to the address from which last query was sent,  coin amount should be equal to value
+    and it should contain corresponding message body. All scores and values are guaranteed to be different
+  Note, that in addition to gas-fees, storage fees will be used to determine final score.
+  In particular, storage fee will be calculated like between each message passes 3 days (259200 seconds).
+  Gas-units price and storage fee params will correspond to current configs of masterchain:
+   1000 nanoTON per 65536 bits per second + 500000 nanoTON per 65536 cells per second;
+    gas is 10000 nanoTON per unit.
+
+
+
+  Example:
+  (message with score x and value y are represented as `(x,y)` )
+
+  incoming message   outcoming messages
+  (1, 5)           | -
+  (2, 6)           | -
+  (3, 100)         | -
+  (4, 2)           | -
+  (5, 3)           | -
+  (6, 4)           | -
+  (7, 7)           | -
+  (8, 8)           | -
+  (9, 9)           | -
+  (10, 10)         | -
+  (11, 11)         | -
+  (12, 20)         | (12,20); (4,2)
+  (15, 1)          | -
+  (13, 13)         | (15, 1)
+  (14, 14)         | (14,14); (5,3)
+-}
+
+{-
+Storage layout
++-----+-----------+------------+----------------+---------------+---------+---------+
+|  n  | max_score |  min_value |  max_score_idx | min_value_idx | score_i | value_i |
+|  4  |    32     |    VU16    |       4        |      4        |     32  |  VU16   |
++-----+-----------+------------+----------------+---------------+---------+---------+
+Messages from the queries stored as a ref chain (messages with the two references):
+
+1-th bucket -> 2-nd bucket -> 3-rd bucket ...
+   |             |            |
+   V             V            V
+ 1 msg         5 msg       9 msg
+   |             |            |
+   V             V            V
+ 2 msg         6 msg       10 msg
+   |             |            |
+   V             V            V
+ 3 msg         7 msg       11 msg
+   |             |            |
+   V             V            V
+ 4 msg         8 msg       12 msg
+-}
+;;
+() send_msg(int value, cell msg) impure inline {
+    var msg = begin_cell()
+                    .store_uint(0x18, 6)
+                    .store_slice("Ef8zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM0vF"a) ;; fake address
+                    .store_coins(value)
+                    .store_uint(0, 106)
+                    .store_uint(1, 1)
+                    .store_ref(msg);
+
+            send_raw_message(msg.end_cell(), 0);
+}
+
+;; testable
+() recv_internal (slice in_msg_body) impure {
+    (int score, int value, cell msg) = (in_msg_body~load_uint(32), in_msg_body~load_coins(), in_msg_body~load_ref());
+
+    ;; start reading storage
+    slice queue_in = get_data().begin_parse();
+    ;; update storage
+    builder queue_out = begin_cell();
+
+    int queue_size = 0;
+    if (queue_in.slice_empty?()) {
+        queue_size = 0;
+    } else {
+        queue_size = queue_in~load_uint(4);
+    }
+
+    ;; time to fire message
+    if (queue_size == 11) {
+        (int prev_max_score, int prev_min_value) = (queue_in~load_uint(32), queue_in~load_coins());
+        (int max_score_idx, int min_value_idx) = (queue_in~load_uint(4), queue_in~load_uint(4));
+        int send_new = 0; ;; should the current message be sent?
+        if (score > prev_max_score) {
+            max_score_idx = 12; ;; current item
+            send_new = 1;
+        }
+        if (value < prev_min_value) {
+            min_value_idx = 12; ;; current item
+            if (send_new == 1) { ;; the only message to delete is the new one - no need to rearrange queue
+                send_msg(value, msg);
+                return ();
+            }
+            send_new = 1;
+            prev_min_value = value;
+        }
+
+        (int new_max_score, int new_min_value) = (-1, 1 << 255);
+        (int new_max_score_idx, int new_min_value_idx) = (0, 0);
+
+        ;; +1 item, -2 item
+        int new_queue_size = 10;
+
+        ;; +1 item, -1 items
+        if (max_score_idx == min_value_idx) {
+            new_queue_size = 11;
+        }
+        ;; new queue size
+        queue_out~store_uint(new_queue_size, 4);
+
+        ;; rebuild score&value table
+        builder new_table = begin_cell();
+
+        int i = 0;
+        int actual_index = 0;
+        ;; rebuild stored messages list
+        builder bucket_new = begin_cell();
+        ;; existing buckets
+        slice bucket_old = queue_in~load_ref().begin_parse();
+
+        repeat(queue_size) {
+            ;; switch to the next bucket if current is empty
+            if (bucket_old.slice_refs_empty?()) {
+                bucket_old = queue_in~load_ref().begin_parse();
+            }
+
+            if ((i == max_score_idx) | (i == min_value_idx)) {
+                ;; skip score
+                queue_in~skip_bits(32);
+                send_msg(queue_in~load_coins(), bucket_old~load_ref());
+            } else {
+                (int current_score, int current_value) = (queue_in~load_uint(32), queue_in~load_coins());
+                if (current_score > new_max_score) {
+                    new_max_score = current_score;
+                    new_max_score_idx = actual_index;
+                }
+                if (current_value < new_min_value) {
+                    new_min_value = current_value;
+                    new_min_value_idx = actual_index;
+                }
+                new_table~store_uint(current_score, 32);
+                new_table = new_table.store_coins(current_value);
+
+                bucket_new = bucket_new.store_ref(bucket_old~load_ref());
+                ;; current bucket is filled, rotating
+                if (bucket_new.builder_refs() == 4) {
+                    queue_out = queue_out.store_ref(bucket_new.end_cell());
+                    bucket_new = begin_cell();
+                }
+                actual_index += 1;
+            }
+            i += 1;
+        };
+
+        ;; new item has to be removed
+
+        if (send_new) {
+            send_msg(value, msg);
+        } else {
+            ;; append new item
+            new_table~store_uint(score, 32);
+            new_table = new_table.store_coins(value);
+            if (score > new_max_score) {
+                new_max_score = score;
+                new_max_score_idx = new_queue_size - 1;
+            }
+            if (value < new_min_value) {
+                new_min_value = value;
+                new_min_value_idx = new_queue_size - 1;
+            }
+            bucket_new = bucket_new.store_ref(msg);
+        }
+
+        ;; store the last backet
+        if (bucket_new.builder_refs() > 0) {
+            queue_out = queue_out.store_ref(bucket_new.end_cell());
+        }
+
+        queue_out~store_uint(new_max_score, 32);
+        queue_out = queue_out.store_coins(new_min_value);
+        queue_out~store_uint(new_max_score_idx, 4);
+        queue_out~store_uint(new_min_value_idx, 4);
+        queue_out = queue_out.store_builder(new_table);
+    } else { ;; just add new query
+        ;; derermine max score and min value for future use
+        (int max_score, int min_value) = (score, value);
+        ;; append new item to the end
+        (int max_score_idx, int min_value_idx) = (queue_size, queue_size);
+
+        builder bucket = begin_cell();
+
+        if (queue_size > 0) {
+            (int prev_max_score, int prev_min_value) = (queue_in~load_uint(32), queue_in~load_coins());
+            (int prev_max_score_idx, int prev_min_value_idx) = (queue_in~load_uint(4), queue_in~load_uint(4));
+
+            if (prev_max_score > max_score) {
+                max_score = prev_max_score;
+                max_score_idx = prev_max_score_idx;
+            }
+
+            if (prev_min_value < min_value) {
+                min_value = prev_min_value;
+                min_value_idx = prev_min_value_idx;
+            }
+            ;; copy full buckets
+            if (queue_size > 3) {
+                queue_out = queue_out.store_ref(queue_in~load_ref());
+            }
+            if (queue_size > 7) {
+                queue_out = queue_out.store_ref(queue_in~load_ref());
+            }
+            if (~ queue_in.slice_refs_empty?()) {
+                ;; fullfil the last bucket with existing refs
+                slice last_bucket = queue_in~load_ref().begin_parse();
+                do {
+                    bucket = bucket.store_ref(last_bucket~load_ref());
+                } until (last_bucket.slice_refs_empty?())
+            }
+        }
+        ;; append current item
+        queue_out = queue_out.store_ref(bucket.store_ref(msg).end_cell());
+
+        queue_out~store_uint(queue_size + 1, 4);
+        ;; store max/min markers
+        queue_out~store_uint(max_score, 32);
+        queue_out = queue_out.store_coins(min_value);
+        queue_out~store_uint(max_score_idx, 4);
+        queue_out~store_uint(min_value_idx, 4);
+
+        ;; rest of the data if any
+        queue_out = queue_out.store_slice(queue_in);
+        ;; adding new message to the end
+        queue_out~store_uint(score, 32);
+        queue_out = queue_out.store_coins(value);
+    }
+
+    set_data(queue_out
+            .end_cell());
+    return ();
+}
+

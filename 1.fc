@@ -1,0 +1,185 @@
+{-
+  In TON there is a limit on the size of the external message which can be sent equal to 64 kB.
+  Sometimes it is necessary to send a larger message; it requires the onchain construction of one message
+  from multiple smaller parts. Your task is to create such construction contract.
+  In particular, a contestant needs to develop a FunC contract with two features:
+    a) it has get_method "decomposite" for decomposition of large cell to parts: it accepts 1 cell
+    (number_of_bits<1 000 000, number_of_cells<4 000 , depth<256) and 1 address and returns tuple of cells
+     (each of which has less than 1000 distinct cells and 40 000 bits total), those cells will be transformed
+     o slice and sent as internal message body to the contract.
+    b) recv_internal should handle those internal messages from get-method described above and upon receiving last one,
+    send initial large cell to the address (coins amount 0, mode 0). For simplicity, it is guaranteed that messages
+    will be sent exactly in the order in which they were in decomposite output and no other messages
+     will be sent in between.
+  Note, that initial state of contract storage will be empty cell: cell with zero bits and refs.
+-}
+
+const int max_bits = 35000;
+const int max_cells = 200;
+
+int tuple_length(tuple t) asm "TLEN";
+
+;; fix for broken stdlib.fc on contest test system
+(cell, int) udict_get_ref?fixed(cell dict, int key_len, int index) asm(index dict key_len) "DICTUGETREF" "NULLSWAPIFNOT";
+
+(slice, int) udict_get?fixed(cell dict, int key_len, int index) asm(index dict key_len) "DICTUGET" "NULLSWAPIFNOT";
+
+cell load_data() inline {
+    slice ds = get_data().begin_parse();
+    if (ds.slice_empty?()) {
+        return new_dict();
+    } else {
+        return ds~load_dict();
+    }
+}
+
+() save_data (cell dict) impure inline {
+    set_data(begin_cell().store_dict(dict).end_cell());
+}
+
+cell walk_tree(cell cache, cell batch) impure {
+    slice current = batch.begin_parse();
+    int key = current~load_uint(16);
+    cell data = current~load_ref();
+    if (~ current.slice_refs_empty?()) {
+        cache = walk_tree(cache, current~load_ref());
+    }
+    builder out = begin_cell();
+
+    while (~ current.slice_data_empty?()) {
+        int reference = current~load_uint(16);
+        (cell child, _) = cache.udict_get_ref?fixed(16, reference);
+        out = out.store_ref(child);
+    }
+    out = out.store_slice(data.begin_parse());
+    cache~udict_set_ref(16, key, out.end_cell());
+    return cache;
+}
+
+;; testable
+() recv_internal (slice body) {
+    int op = body~load_uint(4);
+    if (op == 1) {
+        cell cache = load_data();
+        cell batch = body~load_ref();
+        cache = walk_tree(cache, batch);
+        if (~ body.slice_data_empty?()) {
+            slice address = body~load_msg_addr();
+            (cell result, _) = cache.udict_get_ref?fixed(16, 1);
+            var msg = begin_cell()
+                    .store_uint(0x18, 6)
+                    .store_slice(address)
+                    .store_coins(0)
+                    .store_uint(0, 106)
+                    .store_uint(1, 1).store_ref(result);
+
+            send_raw_message(msg.end_cell(), 0);
+            save_data(new_dict());
+            return ();
+        }
+        save_data(cache);
+    } else {  ;; (op == 0)
+        ;; send as is
+        var msg = begin_cell()
+                .store_uint(0x18, 6)
+                .store_slice(body~load_msg_addr())
+                .store_coins(0)
+                .store_uint(0, 106)
+                .store_uint(1, 1).store_ref(body~load_ref());
+
+        send_raw_message(msg.end_cell(), 0);
+    }
+}
+
+;; walk tree recursively and creates output cells
+(tuple, cell, cell, int, int, int) recursive_split_v2(tuple out, cell tail, cell dedup, cell c,
+        int current_size, int current_count, int index) {
+    int key = c.cell_hash();
+    dedup~udict_set_builder(256, key, begin_cell().store_uint(index, 16));
+
+    ;; cell container to be pushed to the output list
+    builder container = begin_cell()
+            .store_uint(index, 16); ;; cell index
+
+    slice current_cell = c.begin_parse();
+    ;; lets count downstream increments
+    int index_inc = 0;
+
+    while (~ current_cell.slice_refs_empty?()) {
+        cell child = current_cell~load_ref();
+        int current_key = cell_hash(child);
+        (slice current, int found) = dedup.udict_get?fixed(256, current_key);
+
+        if (found == 0) {
+            index_inc += 1;
+            container~store_uint(index + index_inc, 16); ;; cell reference
+            (out, tail, dedup, int child_index_inc, current_size, current_count) = recursive_split_v2(out,
+                    tail, dedup, child, current_size, current_count, index + index_inc);
+            index_inc += child_index_inc;
+        } else {
+            int new_index = current~load_uint(16);
+            container~store_uint(new_index, 16);
+        }
+    }
+
+    ;; add cell data intself
+    int bits = current_cell.slice_bits();
+        container = container
+                .store_ref(begin_cell().store_slice(current_cell).end_cell());
+
+    current_size = current_size - bits;
+    if (tail.cell_null?()) {
+        tail = container.end_cell();
+    } else {
+        tail = container.store_ref(tail).end_cell();
+    }
+    if ((current_size < 0) | (current_count < 0)) {
+        out~tpush(begin_cell()
+                .store_uint(1, 4) ;; batch marker
+                .store_ref(tail)
+                .end_cell());
+        tail = null();
+        current_size = max_bits;
+        current_count = max_cells;
+    }
+
+
+    return (out, tail, dedup, index_inc, current_size, current_count - 1);
+}
+
+;; testable
+tuple decomposite (cell big_cell, slice destination_address) method_id {
+    tuple out = empty_tuple();
+
+    ;; 4000 is the max possible count of unique cells
+    (int cells, int bits, _, _) = big_cell.compute_data_size?(4000);
+    ;; in case big_cell is not so big just send it as is
+    if ((cells < 3999) & (bits < 40000 - 4)) {
+        return out.tpush(begin_cell()
+                .store_uint(0, 4) ;; mark with special falg
+                .store_ref(big_cell)
+                .store_slice(destination_address)
+                .end_cell());
+    }
+
+    ;; output tuple
+    tuple out = empty_tuple();
+
+    ;; dict for cells deduplication
+    cell dedup = new_dict();
+    (out, cell tail, _, _, _, _) = recursive_split_v2(out, null(),
+            dedup, big_cell, max_bits, max_cells, 1);
+    if (tail.cell_null?()) {
+        out~tpush(begin_cell()
+                .store_uint(1, 4)
+                .store_slice(destination_address)
+                .end_cell());
+    } else {
+        out~tpush(begin_cell()
+                .store_uint(1, 4)
+                .store_slice(destination_address)
+                .store_ref(tail)
+                .end_cell());
+    }
+    return out;
+}

@@ -1,0 +1,123 @@
+{-
+  Implement Curve25519 addition and multiplication.
+-}
+
+
+;; Montgomery form
+;; kind of dirty trick - accessing global variables is slitly faster then accessing consts...
+global int P; ;; = 57896044618658097711785492504343953926634992332820282019728792003956564819949;
+const int A = 486662;
+
+() recv_internal () { }
+
+int m(int a, int b) inline { (_, int r) = muldivmod(a, b, P); return r; }
+
+int mulmod(int a, int b, int m) inline { (_, int r) = muldivmod(a, b, m); return r; }
+
+(int) invMod(int _x, int _pp) inline {
+    int q = 0;
+    int newT = 1;
+    int r = _pp;
+    int t = 0;
+    while _x {
+        (t, int rem) = divmod(r, _x);
+        (q, newT) = (newT, (q - mulmod(t, newT, _pp)) % _pp);
+        (r, _x) = (_x, rem);
+    }
+
+    return q;
+}
+
+int inverse(x) inline {
+    return invMod(x, P);
+}
+
+;; testable
+(int,int) add(int x1, int y1, int x2, int y2) {
+    P = 57896044618658097711785492504343953926634992332820282019728792003956564819949;
+    int xx = m(x1, 2);
+
+    if (x1 == x2) {
+        int l = (m(m(x1, x1), 3) + m(x1, A << 1)) % P + 1;
+        l = m(l, inverse(m(y1, 2)));
+        int l2 = m(l, l);
+        int x3 = (l2 - A) % P;
+        x3 = (x3 - x1) % P;
+        x3 = (x3 - x2) % P;
+
+        int y3 = m(( (A + xx) % P + x2), l);
+        y3 = (y3 - m(l2, l)) % P;
+        y3 = (y3 - y1) % P;
+
+        return (x3, y3);
+    } else {
+        int x2_x1_inv = inverse((x2 - x1) % P);
+        int l =  m((y2 - y1), x2_x1_inv);
+        int l2 = m(l, l);
+        int x3 = (l2 - A) % P;
+        x3 = (x3 - x1) % P;
+        x3 = (x3 - x2) % P;
+        int l3 = m(l2, l);
+        int y3 = m(m(( (A + xx) % P + x2), (y2 - y1)), x2_x1_inv);
+        y3 = (y3 - l3) % P;
+        y3 = (y3 - y1) % P;
+        return (x3, y3);
+    }
+}
+
+int bit_length(v) inline {
+    int l = 0;
+    while (v > 0) {
+
+        l += 1;
+        v = v >> 1;
+    }
+    return l;
+}
+
+;; testable
+int mul(int x1, int factor) {
+    if (factor == 1) {
+        return x1;
+    }
+    P = 57896044618658097711785492504343953926634992332820282019728792003956564819949;
+    (int u2, int w2) = (1, 0);
+    (int u3, int w3) = (x1, 1);
+
+    int i = bit_length(factor) - 1;
+    while (i >= 0) {
+        int flag = (factor >> i) & 0x1;
+        if (flag) {
+            (u2, u3) = (u3, u2);
+            (w2, w3) = (w3, w2);
+        }
+;;         u3, w3 := ((u2*u3 - w2*w3)^2,
+;;                 u * (u2*w3 - w2*u3)^2)
+        int t = (m(u2, u3) - m(w2, w3));
+        t = m(t, t);
+        int q = (m(u2, w3) - m(w2, u3));
+        q = m(q, q);
+        q = m(x1, q);
+        (u3, w3) = (t, q);
+
+;;         u2, w2 := ((u2^2 - w2^2)^2,
+;;                 4*u2*w2 * (u2^2 + A*u2*w2 + w2^2))
+        int u2_2 = m(u2, u2);
+        int w2_2 = m(w2, w2);
+        t = (u2_2 - w2_2);
+        t = m(t, t);
+        int u2_w2 = m(u2, w2);
+        q = (m(u2_w2, A) + u2_2) % P;
+        q = (q + w2_2);
+        q = m(m(q, u2_w2), 4);
+        (u2, w2) = (t, q);
+        if (flag) {
+            (u2, u3) = (u3, u2);
+            (w2, w3) = (w3, w2);
+        }
+
+        i -= 1;
+    }
+
+    return m(u2, inverse(w2));
+}

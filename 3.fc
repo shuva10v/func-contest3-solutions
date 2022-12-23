@@ -1,0 +1,202 @@
+{-
+  Contract receives internal message with text comment (https://ton.org/docs/develop/smart-contracts/guidelines/internal-messages) which
+  pythoncontains algebraic equation containing numbers in decimal representation and operations `(+-*/)`.
+  All values (including intermediate) fit 256 bit. Contract should respond (coins = 0, mode = 64) with correct answer encoded as text comment back.
+  It is guaranteed that all tests contain a valid algebraic equations.
+  Division result should be rounded down. It is guaranteed that tests do not contain division by zero.
+  -}
+
+int priority(int _type) inline {
+    return _type & 1;
+;;     if ((_type == 43) | (_type == 45)) {
+;;         return 1;
+;;     }
+;;     return 2;
+}
+
+{-
+((slice, has_next) type, value)
+type = 0: number
+type = 43: plus
+type = 45: minus
+type = 42: mul
+type = 47: div -> 46
+type = 40: (
+type = 41: )
+-}
+;; (slice, int, int, int) parse_token(slice s) inline {
+(slice, int, int) parse_token_v2(slice s) inline {
+
+    int char = s~load_uint(8);
+
+    if (char < 48) {
+        ;; replace div code to make it possible fast priority calculation
+        if (char == 47) {
+            char = 46;
+        }
+        return (s, char, 0);
+    }
+
+    int buffer = char - 48;
+    while (~ s.slice_data_empty?()) {
+        ;; TODO avoid preload
+        int next_char = s.preload_uint(8);
+        if (next_char >= 48) {
+            buffer = buffer * 10 + next_char - 48;
+            s~skip_bits(8);
+        } else {
+            return (s, 0, buffer);
+        }
+    }
+    ;; multi-digit number
+    return (s, 0, buffer);
+}
+
+int tuple_length(tuple t) asm "TLEN";
+
+builder print_decimal(int value, builder out) inline {
+    if (value < 0) {
+        out~store_uint(45, 8);
+        return print_decimal(- value, out);
+    }
+    if (value == 0) {
+        out~store_uint(48, 8);
+    } else {
+        tuple buff = empty_tuple();
+        while (value > 0) {
+            buff~tpush(48 + value % 10);
+            value = value / 10;
+        }
+        int idx = buff.tuple_length() - 1;
+        while (idx >= 0) {
+            out~store_uint(buff.at(idx), 8);
+            idx -= 1;
+        }
+    }
+    return out;
+}
+
+(tuple) process_item(tuple out_stack, int _type) inline {
+
+;;         ;; unary negation corner case, ignored due to hack in parse_rpn_calculate
+;;         if ((stack.tuple_length() == 0) & (_type == 45)) {
+;;             res = - l;
+;;         } else {
+    int res = 0;
+    int l = out_stack~list_next();
+    int r = out_stack~list_next();
+    ;; minimize branching
+    if (_type == 43) {
+        return cons(l + r, out_stack);
+    } else {
+        if (_type == 42) {
+            return cons(l * r, out_stack);
+        } else {
+            if (_type == 45) {
+                return cons(r - l, out_stack);
+            } else { ;; if (_type == 47) {
+                return cons(r / l, out_stack);
+            }
+        }
+    }
+}
+
+
+(tuple, tuple) close_parenthesis(tuple stack, tuple out_stack) inline {
+    do {
+        (_, int _top_op_type) = stack.list_next();
+        if (_top_op_type != 40) { ;; (
+            stack~list_next();
+            out_stack = process_item(out_stack, _top_op_type);
+            if (~ stack.tuple_length()) {
+                return (stack, out_stack);
+            }
+        } else {
+            return (stack, out_stack);
+        }
+    } until (0);
+    return (stack, out_stack);
+}
+
+int parse_rpn_calculate(slice expr) inline {
+    ;; kind of dirty hack to support unary minus operator - add 0 to the top of the stack
+    tuple stack = empty_tuple();
+    tuple out_stack = cons(0, empty_tuple());
+    do {
+        (expr, int _type, int value ) = parse_token_v2(expr);
+
+        ;; operand
+        if (_type == 0) {
+            var updated = cons(value, out_stack);
+            out_stack = updated;
+        } else { ;; operator
+            if (_type > 41) {
+                int need_pop = stack.tuple_length();
+                while (need_pop) {
+                    (_, int current_type) = stack.list_next();
+
+                    if (current_type == 40) {
+                        need_pop = 0;
+                    } else {
+                        if (priority(_type) < priority(current_type)) {
+                            need_pop = 0;
+                        } else {
+                            stack~list_next();
+                            out_stack = process_item(out_stack, current_type);
+                            need_pop = stack.tuple_length();
+                        }
+                    }
+                };
+
+                stack = cons(_type, stack);
+            } else {
+                if (_type == 40) { ;; (
+                    stack = cons(_type, stack);
+                } else { ;; )
+                    (stack, out_stack) = close_parenthesis(stack, out_stack);
+                    stack~list_next();
+                }
+            }
+        }
+        if (expr.slice_data_empty?()) {
+            if (expr.slice_refs()) {
+                expr = expr~load_ref().begin_parse();
+            } else {
+                ;; push all ops from stack to the output
+                while (stack.tuple_length()) {
+                    int _op = stack~list_next();
+                    out_stack = process_item(out_stack, _op);
+                }
+
+                return car(out_stack);
+            }
+        }
+    } until (0);
+    ;; unreacheable
+    return 0;
+}
+
+;; testable
+() recv_internal (cell message, slice in_msg_body) {
+    slice cs = message.begin_parse();
+    cs~skip_bits(4); ;; skip flags
+
+    slice sender_address = cs~load_msg_addr();
+    in_msg_body~skip_bits(32);
+    slice comment = in_msg_body;
+
+    int res = parse_rpn_calculate(comment);
+    builder response = begin_cell().store_uint(0, 32);
+    response = print_decimal(res, response);
+
+
+    var response = begin_cell()
+                    .store_uint(0x18, 6)
+                    .store_slice(sender_address)
+                    .store_coins(0)
+                    .store_uint(0, 106)
+                    .store_uint(1, 1)
+                    .store_ref(response.end_cell());
+
+    send_raw_message(response.end_cell(), 64);
+}
