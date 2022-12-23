@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "@noble/ed25519": "^1.7.1",
+    "@ton-community/func-js": "^0.2.1",
+    "body-parser": "^1.20.1",
+    "is-equal-objects": "^0.3.0",
+    "random-bigint": "^0.0.1",
+    "ton-contract-executor": "^0.6.2"
+  }
+}
